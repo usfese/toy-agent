@@ -1,0 +1,7 @@
+{
+  "client": {
+    "api_key": "your-api-key",
+    "model": "your-model",
+    "base_url": "https://api.openai.com/v1"
+  }
+}
