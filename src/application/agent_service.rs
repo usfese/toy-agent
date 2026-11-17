@@ -63,7 +63,6 @@ impl AgentService {
     }
 
     pub fn chat(&mut self, session_id: &str, user_message: &str) -> anyhow::Result<String> {
-        // 大概是为以后并发预留的锁
         let _lock = self.session_store.lock(session_id)?;
         let mut session = self
             .session_store
@@ -75,8 +74,7 @@ impl AgentService {
 
         // 如果执行后、持久化前发生崩溃，执行结果将无法确定。
         // 绝不重放未完成的调用；接收新输入前，先记录其结果未知。
-
-        // pending是即将执行的工具调用
+        // 下面处理一下上次中断的工具调用
         let mut pending = Vec::new();
         for message in &session.messages {
             match message {
