@@ -1,5 +1,5 @@
-use crate::{application::model_setting::ModelSetting, domain::{context::Context, message::Message}};
+use crate::{application::model_setting::ModelSetting, domain::{context::Context, message::AssistantMessage}};
 
 pub trait ModelClient {
-    fn generate(&self, context: &Context, settings: &ModelSetting) -> anyhow::Result<Message>;
+    fn generate(&self, context: &Context<'_>, settings: &ModelSetting) -> anyhow::Result<AssistantMessage>;
 }

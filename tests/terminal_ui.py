@@ -4,16 +4,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self,*a): pass
     def do_POST(self):
         data=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        assert self.headers.get('Authorization') == 'Bearer test'
         if data['messages'][-1]['role']=='user':
-            message={'role':'assistant','content':None,'tool_calls':[{'id':'a1','type':'function','function':{'name':'bash','arguments':json.dumps({'command':'printf tool-ok'})}}]}
+            assert data['messages'][-1]['content'] == '  hello\n'
+            message={'role':'assistant','content':None,'tool_calls':[{'id':'a1','type':'function','function':{'name':'bash','arguments':json.dumps({'command':'printf tool-ok #\u202e'})}}]}
+            reason='tool_calls'
         else:
             message={'role':'assistant','content':'# Heading\n\n**bold**\n\n'+'\n\n'.join(f'line-{i:02}' for i in range(60))}
-        body=json.dumps({'choices':[{'message':message}]}).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+            reason='stop'
+        body=json.dumps({'choices':[{'message':message,'finish_reason':reason}]}).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
 s=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=s.serve_forever,daemon=True).start()
 with tempfile.TemporaryDirectory() as tmp:
     config = os.path.join(tmp, 'config.json')
-    with open(config, 'w') as f: json.dump({'client': {}}, f)
-    env={**os.environ,'TERM':'xterm-256color','TOY_AGENT_CONFIG':config,'TOY_AGENT_SESSIONS':tmp,'OPENAI_API_KEY':'test','OPENAI_MODEL':'test-model','OPENAI_BASE_URL':f'http://127.0.0.1:{s.server_port}/v1'}
+    with open(config, 'w') as f: json.dump({'client': {'api_key': 'test'}}, f)
+    env={**os.environ,'TERM':'xterm-256color','TOY_AGENT_CONFIG':config,'TOY_AGENT_SESSIONS':tmp,'OPENAI_API_KEY':'ignored','OPENAI_MODEL':'test-model','OPENAI_BASE_URL':f'http://127.0.0.1:{s.server_port}/v1'}
     master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',24,90,0,0))
     original_termios = termios.tcgetattr(slave)
     proc=subprocess.Popen([binary],stdin=slave,stdout=slave,stderr=slave,env=env)
@@ -35,7 +39,9 @@ with tempfile.TemporaryDirectory() as tmp:
     send('z'); expect('z')
     assert '❯'.encode() not in output[start:offset], 'input prompt was repainted while typing'
     send('\x1b[200~first\n第二\x1b[201~'); expect('第二')
-    send('\x03'); send('hello\r'); expect('Allow? [y/N]'); send('y\n'); expect('Heading');expect('bold');expect('line-59');expect('test-model')
+    send('\x03'); send('\x1b[200~  hello\n\x1b[201~\r'); expect('Allow? [y/N]')
+    assert b'\\u{202e}' in output, 'bidirectional control is not visibly escaped'
+    send('y\n'); expect('Heading');expect('bold');expect('line-59');expect('test-model')
     assert output.count(b'\x1b[?1049h')==1, output.count(b'\x1b[?1049h')
     assert b'\x1b[?1049l' not in output, 'left alternate screen during request'
     send('\x1b[5~'); expect('line-')

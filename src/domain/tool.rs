@@ -8,6 +8,7 @@ pub struct ToolDefinition {
 }
 
 pub trait Tool {
+    fn name(&self) -> &str;
     fn definition(&self) -> ToolDefinition;
     fn execute(&self, arguments: &Value) -> anyhow::Result<String>;
 }

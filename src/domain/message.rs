@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssistantMessage {
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
