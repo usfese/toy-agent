@@ -152,7 +152,6 @@ fn entry_lines(entries: &[Entry]) -> Vec<Line<'static>> {
             Entry::Tool(text) => ("tool", Color::Yellow, text),
             Entry::Status { id, model, directory } => {
                 lines.push(Line::from(vec![
-                    Span::styled(" π ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Span::styled(" ❯ ", Style::default().fg(Color::Black).bg(Color::Blue)),
                     Span::styled(format!(" ⬢ {} ", status_text(model)), Style::default().fg(Color::Black).bg(Color::Green)),
                     Span::styled(format!(" session {} ", status_text(id)), Style::default().fg(Color::Black).bg(Color::Yellow)),
@@ -231,7 +230,7 @@ fn print_entries(entries: &[Entry]) -> anyhow::Result<()> {
     for entry in entries {
         match entry {
             Entry::Status { id, model, directory } => println!(
-                "\x1b[30;46;1m π \x1b[30;44m ❯ \x1b[30;42m ⬢ {} \x1b[30;43m session {} \x1b[37;100m {} \x1b[0m",
+                "\x1b[30;44m ❯ \x1b[30;42m ⬢ {} \x1b[30;43m session {} \x1b[37;100m {} \x1b[0m",
                 status_text(model), status_text(id), status_text(directory)
             ),
             Entry::Assistant(text) => {

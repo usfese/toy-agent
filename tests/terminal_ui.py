@@ -47,6 +47,7 @@ with tempfile.TemporaryDirectory() as tmp:
         try: output+=os.read(master,65536)
         except OSError: break
     assert proc.returncode==0,proc.returncode
+    assert 'π'.encode() not in output, 'unexpected Pi branding'
     assert output.count(b'\x1b[?1049l')==1,output.count(b'\x1b[?1049l')
     assert termios.tcgetattr(slave) == original_termios, 'terminal settings not restored'
     os.close(slave); os.close(master)
