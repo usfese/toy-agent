@@ -5,19 +5,24 @@ use crate::{
         model_client::ModelClient,
         model_setting::ModelSetting,
         role::{
-            assisstant::Assisstant,
+            assistant::Assistant,
             tool_call_reviewer::{Decision, ToolCallReviewer},
         },
         session_store::SessionStore,
     },
-    domain::{context::Context, message::{AssistantMessage, Message}, session::Session, tool::ToolDefinition},
+    domain::{
+        context::Context,
+        message::{AssistantMessage, Message},
+        session::Session,
+        tool::ToolDefinition,
+    },
 };
 use anyhow::{Context as _, bail};
 
 pub struct AgentService {
     model_client: Box<dyn ModelClient>,
     session_store: Box<dyn SessionStore>,
-    assistant: Assisstant,
+    assistant: Assistant,
     reviewer: Box<dyn ToolCallReviewer>,
     model_setting: ModelSetting,
     max_iterations: usize,
@@ -25,7 +30,14 @@ pub struct AgentService {
 }
 
 impl AgentService {
-    pub fn new(model_client: Box<dyn ModelClient>, session_store: Box<dyn SessionStore>, assistant: Assisstant, reviewer: Box<dyn ToolCallReviewer>, model_setting: ModelSetting, max_iterations: usize) -> anyhow::Result<Self> {
+    pub fn new(
+        model_client: Box<dyn ModelClient>,
+        session_store: Box<dyn SessionStore>,
+        assistant: Assistant,
+        reviewer: Box<dyn ToolCallReviewer>,
+        model_setting: ModelSetting,
+        max_iterations: usize,
+    ) -> anyhow::Result<Self> {
         if max_iterations == 0 {
             bail!("max_iterations must be positive");
         }
@@ -33,16 +45,31 @@ impl AgentService {
         let mut tool_definitions = Vec::with_capacity(assistant.tools.len());
         for tool in &assistant.tools {
             let definition = tool.definition();
-            if tool.name().is_empty() || definition.name != tool.name() || !names.insert(definition.name.clone()) {
+            if tool.name().is_empty()
+                || definition.name != tool.name()
+                || !names.insert(definition.name.clone())
+            {
                 bail!("invalid or duplicate tool name: {}", tool.name());
             }
             tool_definitions.push(definition);
         }
-        Ok(Self { model_client, session_store, assistant, reviewer, model_setting, max_iterations, tool_definitions })
+        Ok(Self {
+            model_client,
+            session_store,
+            assistant,
+            reviewer,
+            model_setting,
+            max_iterations,
+            tool_definitions,
+        })
     }
 
-    pub fn model_id(&self) -> &str { &self.model_setting.model_id }
-    pub fn set_model(&mut self, model: String) { self.model_setting.model_id = model; }
+    pub fn model_id(&self) -> &str {
+        &self.model_setting.model_id
+    }
+    pub fn set_model(&mut self, model: String) {
+        self.model_setting.model_id = model;
+    }
     pub fn load_session(&self, id: &str) -> anyhow::Result<Option<Session>> {
         self.session_store.load(id)
     }
@@ -90,27 +117,40 @@ impl AgentService {
                 tools: &self.tool_definitions,
                 messages: &session.messages,
             };
-            let AssistantMessage { content, tool_calls } = self
-                .model_client
-                .generate(&context, &self.model_setting)?;
+            let AssistantMessage {
+                content,
+                tool_calls,
+            } = self.model_client.generate(&context, &self.model_setting)?;
             let mut ids = HashSet::new();
-            if tool_calls
-                .iter()
-                .any(|call| call.id.is_empty() || call.name.is_empty() || !call.arguments.is_object() || !ids.insert(&call.id))
-            {
-                bail!("model returned invalid tool calls (empty or duplicate ID, empty name, or non-object arguments)");
+            if tool_calls.iter().any(|call| {
+                call.id.is_empty()
+                    || call.name.is_empty()
+                    || !call.arguments.is_object()
+                    || !ids.insert(&call.id)
+            }) {
+                bail!(
+                    "model returned invalid tool calls (empty or duplicate ID, empty name, or non-object arguments)"
+                );
             }
             let call_count = tool_calls.len();
             let assistant_index = session.messages.len();
-            session.messages.push(Message::Assistant { content, tool_calls });
+            session.messages.push(Message::Assistant {
+                content,
+                tool_calls,
+            });
             self.session_store.save(&session)?;
             if call_count == 0 {
-                let Message::Assistant { content, .. } = session.messages.pop().unwrap() else { unreachable!() };
+                let Message::Assistant { content, .. } = session.messages.pop().unwrap() else {
+                    unreachable!()
+                };
                 return Ok(content);
             }
 
             for index in 0..call_count {
-                let Message::Assistant { tool_calls, .. } = &session.messages[assistant_index] else { unreachable!() };
+                let Message::Assistant { tool_calls, .. } = &session.messages[assistant_index]
+                else {
+                    unreachable!()
+                };
                 let call = &tool_calls[index];
                 let result = match self
                     .assistant
@@ -131,7 +171,10 @@ impl AgentService {
                     },
                 };
                 let id = call.id.clone();
-                session.messages.push(Message::Tool { tool_call_id: id, content: result });
+                session.messages.push(Message::Tool {
+                    tool_call_id: id,
+                    content: result,
+                });
                 self.session_store.save(&session).with_context(|| {
                     let Message::Tool { content, .. } = session.messages.last().unwrap() else { unreachable!() };
                     format!("saving tool result failed; execution may already have occurred. Result: {content}")
@@ -156,35 +199,67 @@ mod tests {
     impl SessionLock for Guard {}
     struct Store(Rc<RefCell<Option<Session>>>);
     impl SessionStore for Store {
-        fn lock(&self, _: &str) -> anyhow::Result<Box<dyn SessionLock>> { Ok(Box::new(Guard)) }
-        fn list(&self) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
-        fn load(&self, _: &str) -> anyhow::Result<Option<Session>> { Ok(self.0.borrow().clone()) }
+        fn lock(&self, _: &str) -> anyhow::Result<Box<dyn SessionLock>> {
+            Ok(Box::new(Guard))
+        }
+        fn list(&self) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        fn load(&self, _: &str) -> anyhow::Result<Option<Session>> {
+            Ok(self.0.borrow().clone())
+        }
         fn save(&mut self, session: &Session) -> anyhow::Result<()> {
-            *self.0.borrow_mut() = Some(session.clone()); Ok(())
+            *self.0.borrow_mut() = Some(session.clone());
+            Ok(())
         }
     }
     struct Model;
     impl ModelClient for Model {
-        fn generate(&self, context: &Context<'_>, _: &ModelSetting) -> anyhow::Result<AssistantMessage> {
+        fn generate(
+            &self,
+            context: &Context<'_>,
+            _: &ModelSetting,
+        ) -> anyhow::Result<AssistantMessage> {
             assert!(context.messages.iter().any(|message| matches!(message, Message::Tool { tool_call_id, content } if tool_call_id == "pending" && content.contains("unknown"))));
-            Ok(AssistantMessage { content: "done".into(), tool_calls: vec![] })
+            Ok(AssistantMessage {
+                content: "done".into(),
+                tool_calls: vec![],
+            })
         }
     }
     struct Reviewer;
     impl ToolCallReviewer for Reviewer {
-        fn review(&self, _: &ToolCall) -> anyhow::Result<Decision> { Ok(Decision::Allowed) }
+        fn review(&self, _: &ToolCall) -> anyhow::Result<Decision> {
+            Ok(Decision::Allowed)
+        }
     }
     #[test]
     fn interrupted_calls_are_resolved_without_replaying_them() {
         let saved = Rc::new(RefCell::new(Some(Session {
             id: "s".into(),
-            messages: vec![Message::Assistant { content: String::new(), tool_calls: vec![ToolCall {
-                id: "pending".into(), name: "bash".into(), arguments: serde_json::json!({}),
-            }] }],
+            messages: vec![Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "pending".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            }],
         })));
-        let mut service = AgentService::new(Box::new(Model), Box::new(Store(saved.clone())),
-            Assisstant { instruction: String::new(), tools: vec![] }, Box::new(Reviewer),
-            ModelSetting { model_id: "m".into() }, 1).unwrap();
+        let mut service = AgentService::new(
+            Box::new(Model),
+            Box::new(Store(saved.clone())),
+            Assistant {
+                instruction: String::new(),
+                tools: vec![],
+            },
+            Box::new(Reviewer),
+            ModelSetting {
+                model_id: "m".into(),
+            },
+            1,
+        )
+        .unwrap();
         assert_eq!(service.chat("s", "next").unwrap(), "done");
         assert_eq!(saved.borrow().as_ref().unwrap().messages.len(), 4);
     }
@@ -196,24 +271,41 @@ mod tests {
 
         struct CallingModel(Rc<Cell<usize>>);
         impl ModelClient for CallingModel {
-            fn generate(&self, _: &Context<'_>, _: &ModelSetting) -> anyhow::Result<AssistantMessage> {
+            fn generate(
+                &self,
+                _: &Context<'_>,
+                _: &ModelSetting,
+            ) -> anyhow::Result<AssistantMessage> {
                 let turn = self.0.get();
                 self.0.set(turn + 1);
                 Ok(if turn == 0 {
                     AssistantMessage {
                         content: String::new(),
-                        tool_calls: vec![ToolCall { id: "call".into(), name: "count".into(), arguments: serde_json::json!({}) }],
+                        tool_calls: vec![ToolCall {
+                            id: "call".into(),
+                            name: "count".into(),
+                            arguments: serde_json::json!({}),
+                        }],
                     }
                 } else {
-                    AssistantMessage { content: "done".into(), tool_calls: vec![] }
+                    AssistantMessage {
+                        content: "done".into(),
+                        tool_calls: vec![],
+                    }
                 })
             }
         }
         struct CountingTool(Rc<Cell<usize>>);
         impl Tool for CountingTool {
-            fn name(&self) -> &str { "count" }
+            fn name(&self) -> &str {
+                "count"
+            }
             fn definition(&self) -> ToolDefinition {
-                ToolDefinition { name: "count".into(), description: String::new(), parameters: serde_json::json!({}) }
+                ToolDefinition {
+                    name: "count".into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                }
             }
             fn execute(&self, _: &serde_json::Value) -> anyhow::Result<String> {
                 self.0.set(self.0.get() + 1);
@@ -225,9 +317,17 @@ mod tests {
         let mut service = AgentService::new(
             Box::new(CallingModel(Rc::new(Cell::new(0)))),
             Box::new(Store(saved.clone())),
-            Assisstant { instruction: String::new(), tools: vec![Box::new(CountingTool(calls.clone()))] },
-            Box::new(Reviewer), ModelSetting { model_id: "m".into() }, 1,
-        ).unwrap();
+            Assistant {
+                instruction: String::new(),
+                tools: vec![Box::new(CountingTool(calls.clone()))],
+            },
+            Box::new(Reviewer),
+            ModelSetting {
+                model_id: "m".into(),
+            },
+            1,
+        )
+        .unwrap();
         let error = service.chat("s", "first").unwrap_err().to_string();
         assert!(error.contains("completed tool results were saved"));
         assert!(saved.borrow().as_ref().unwrap().messages.iter().any(

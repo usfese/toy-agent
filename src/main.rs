@@ -8,7 +8,7 @@ use adapter::{
 };
 use anyhow::{Context, bail};
 use application::{
-    agent_service::AgentService, model_setting::ModelSetting, role::assisstant::Assisstant,
+    agent_service::AgentService, model_setting::ModelSetting, role::assistant::Assistant,
     session_store::SessionStore,
 };
 use std::env;
@@ -57,7 +57,7 @@ fn create_agent(directory: String, config: ClientConfig) -> anyhow::Result<Agent
     AgentService::new(
         Box::new(OpenAiClient::new(api_key, base_url)),
         Box::new(JsonlSessionStore::new(directory)),
-        Assisstant {
+        Assistant {
             instruction: "You are a helpful assistant. Use tools only when needed.".into(),
             tools: vec![Box::new(BashTool)],
         },
