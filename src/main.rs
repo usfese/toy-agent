@@ -57,10 +57,7 @@ fn create_agent(directory: String, config: ClientConfig) -> anyhow::Result<Agent
     AgentService::new(
         Box::new(OpenAiClient::new(api_key, base_url)),
         Box::new(JsonlSessionStore::new(directory)),
-        Assistant {
-            instruction: "You are a helpful assistant. Use tools only when needed.".into(),
-            tools: vec![Box::new(BashTool)],
-        },
+        Box::new(Assistant::new(vec![Box::new(BashTool)])?),
         Box::new(TerminalReviewer),
         ModelSetting { model_id },
         10,

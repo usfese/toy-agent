@@ -5,16 +5,14 @@ use crate::{
         model_client::ModelClient,
         model_setting::ModelSetting,
         role::{
-            assistant::Assistant,
+            Role,
             tool_call_reviewer::{Decision, ToolCallReviewer},
         },
         session_store::SessionStore,
     },
     domain::{
-        context::Context,
         message::{AssistantMessage, Message},
         session::Session,
-        tool::ToolDefinition,
     },
 };
 use anyhow::{Context as _, bail};
@@ -22,18 +20,17 @@ use anyhow::{Context as _, bail};
 pub struct AgentService {
     model_client: Box<dyn ModelClient>,
     session_store: Box<dyn SessionStore>,
-    assistant: Assistant,
+    role: Box<dyn Role>,
     reviewer: Box<dyn ToolCallReviewer>,
     model_setting: ModelSetting,
     max_iterations: usize,
-    tool_definitions: Vec<ToolDefinition>,
 }
 
 impl AgentService {
     pub fn new(
         model_client: Box<dyn ModelClient>,
         session_store: Box<dyn SessionStore>,
-        assistant: Assistant,
+        role: Box<dyn Role>,
         reviewer: Box<dyn ToolCallReviewer>,
         model_setting: ModelSetting,
         max_iterations: usize,
@@ -41,26 +38,13 @@ impl AgentService {
         if max_iterations == 0 {
             bail!("max_iterations must be positive");
         }
-        let mut names = HashSet::new();
-        let mut tool_definitions = Vec::with_capacity(assistant.tools.len());
-        for tool in &assistant.tools {
-            let definition = tool.definition();
-            if tool.name().is_empty()
-                || definition.name != tool.name()
-                || !names.insert(definition.name.clone())
-            {
-                bail!("invalid or duplicate tool name: {}", tool.name());
-            }
-            tool_definitions.push(definition);
-        }
         Ok(Self {
             model_client,
             session_store,
-            assistant,
+            role,
             reviewer,
             model_setting,
             max_iterations,
-            tool_definitions,
         })
     }
 
@@ -79,6 +63,7 @@ impl AgentService {
     }
 
     pub fn chat(&mut self, session_id: &str, user_message: &str) -> anyhow::Result<String> {
+        // 大概是为以后并发预留的锁
         let _lock = self.session_store.lock(session_id)?;
         let mut session = self
             .session_store
@@ -88,8 +73,10 @@ impl AgentService {
                 messages: Vec::new(),
             });
 
-        // A crash after execution but before persistence makes the outcome unknowable.
-        // Never replay a pending call: record its uncertainty before accepting new input.
+        // 如果执行后、持久化前发生崩溃，执行结果将无法确定。
+        // 绝不重放未完成的调用；接收新输入前，先记录其结果未知。
+
+        // pending是即将执行的工具调用
         let mut pending = Vec::new();
         for message in &session.messages {
             match message {
@@ -112,15 +99,14 @@ impl AgentService {
         self.session_store.save(&session)?;
 
         for _ in 0..self.max_iterations {
-            let context = Context {
-                instruction: &self.assistant.instruction,
-                tools: &self.tool_definitions,
-                messages: &session.messages,
-            };
             let AssistantMessage {
                 content,
                 tool_calls,
-            } = self.model_client.generate(&context, &self.model_setting)?;
+            } = self.role.respond(
+                self.model_client.as_ref(),
+                &self.model_setting,
+                &session.messages,
+            )?;
             let mut ids = HashSet::new();
             if tool_calls.iter().any(|call| {
                 call.id.is_empty()
@@ -152,12 +138,7 @@ impl AgentService {
                     unreachable!()
                 };
                 let call = &tool_calls[index];
-                let result = match self
-                    .assistant
-                    .tools
-                    .iter()
-                    .find(|tool| tool.name() == call.name)
-                {
+                let result = match self.role.tool(&call.name) {
                     None => format!("Unknown tool: {}", call.name),
                     Some(tool) => match self.reviewer.review(call) {
                         Ok(Decision::Allowed) => match tool.execute(&call.arguments) {
@@ -191,8 +172,10 @@ impl AgentService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::role::assistant::Assistant;
     use crate::application::session_store::SessionLock;
     use crate::domain::message::ToolCall;
+    use crate::domain::{context::Context, tool::ToolDefinition};
     use std::{cell::RefCell, rc::Rc};
 
     struct Guard;
@@ -249,10 +232,7 @@ mod tests {
         let mut service = AgentService::new(
             Box::new(Model),
             Box::new(Store(saved.clone())),
-            Assistant {
-                instruction: String::new(),
-                tools: vec![],
-            },
+            Box::new(Assistant::new(vec![]).unwrap()),
             Box::new(Reviewer),
             ModelSetting {
                 model_id: "m".into(),
@@ -262,6 +242,63 @@ mod tests {
         .unwrap();
         assert_eq!(service.chat("s", "next").unwrap(), "done");
         assert_eq!(saved.borrow().as_ref().unwrap().messages.len(), 4);
+    }
+
+    #[test]
+    fn agent_accepts_another_role_with_its_own_instruction() {
+        use crate::domain::tool::Tool;
+
+        struct PlanningModel;
+        impl ModelClient for PlanningModel {
+            fn generate(
+                &self,
+                context: &Context<'_>,
+                _: &ModelSetting,
+            ) -> anyhow::Result<AssistantMessage> {
+                assert!(
+                    matches!(context.messages.last(), Some(Message::User { content }) if content == "task")
+                );
+                assert_eq!(context.instruction, "plan-instruction");
+                Ok(AssistantMessage {
+                    content: "plan ready".into(),
+                    tool_calls: vec![],
+                })
+            }
+        }
+        struct PlanningRole;
+        impl Role for PlanningRole {
+            fn respond(
+                &self,
+                client: &dyn ModelClient,
+                settings: &ModelSetting,
+                messages: &[Message],
+            ) -> anyhow::Result<AssistantMessage> {
+                client.generate(
+                    &Context {
+                        instruction: "plan-instruction",
+                        tools: &[],
+                        messages,
+                    },
+                    settings,
+                )
+            }
+            fn tool(&self, _: &str) -> Option<&dyn Tool> {
+                None
+            }
+        }
+        let saved = Rc::new(RefCell::new(None));
+        let mut service = AgentService::new(
+            Box::new(PlanningModel),
+            Box::new(Store(saved)),
+            Box::new(PlanningRole),
+            Box::new(Reviewer),
+            ModelSetting {
+                model_id: "m".into(),
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(service.chat("s", "task").unwrap(), "plan ready");
     }
 
     #[test]
@@ -317,10 +354,7 @@ mod tests {
         let mut service = AgentService::new(
             Box::new(CallingModel(Rc::new(Cell::new(0)))),
             Box::new(Store(saved.clone())),
-            Assistant {
-                instruction: String::new(),
-                tools: vec![Box::new(CountingTool(calls.clone()))],
-            },
+            Box::new(Assistant::new(vec![Box::new(CountingTool(calls.clone()))]).unwrap()),
             Box::new(Reviewer),
             ModelSetting {
                 model_id: "m".into(),
