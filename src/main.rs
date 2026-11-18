@@ -3,12 +3,13 @@ pub mod application;
 pub mod domain;
 
 use adapter::{
-    client::openai::OpenAiClient, config::ClientConfig, frontend::cli::TerminalReviewer,
+    client::openai::OpenAiClient, config::ClientConfig, frontend::cli::TerminalApprover,
     session_store::jsonl_session_store::JsonlSessionStore, tool::bash_tool::BashTool,
 };
 use anyhow::{Context, bail};
 use application::{
-    agent_service::AgentService, model_setting::ModelSetting, role::assistant::Assistant,
+    agent_service::AgentService, model_setting::ModelSetting,
+    role::{assistant::Assistant, tool_call_reviewer::ToolCallReviewer},
     session_store::SessionStore,
 };
 use std::env;
@@ -58,7 +59,8 @@ fn create_agent(directory: String, config: ClientConfig) -> anyhow::Result<Agent
         Box::new(OpenAiClient::new(api_key, base_url)),
         Box::new(JsonlSessionStore::new(directory)),
         Box::new(Assistant::new(vec![Box::new(BashTool)])?),
-        Box::new(TerminalReviewer),
+        ToolCallReviewer::new(),
+        Box::new(TerminalApprover),
         ModelSetting { model_id },
         10,
     )

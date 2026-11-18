@@ -11,7 +11,10 @@ use crate::{
     },
 };
 
-const INSTRUCTION: &str = "You are a helpful assistant. Use tools only when needed.";
+const INSTRUCTION: &str = "
+你是一个toy-agent智能体，在需要的时候使用工具，优先使用中文回答，也可以使用其他语言。
+如果在项目中，可以试图寻找AGENT.md并读取以获得项目的相关信息。可以使用Markdown和mermaid。
+";
 
 pub struct Assistant {
     instruction: String,
@@ -42,7 +45,6 @@ impl Assistant {
 }
 
 impl Role for Assistant {
-
     fn respond(
         &self,
         client: &dyn ModelClient,
@@ -58,7 +60,10 @@ impl Role for Assistant {
     }
 
     fn tool(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.iter().find(|tool| tool.name() == name).map(|tool| tool.as_ref())
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == name)
+            .map(|tool| tool.as_ref())
     }
 }
 
@@ -73,7 +78,9 @@ mod tests {
     }
 
     impl Tool for TestTool {
-        fn name(&self) -> &str { self.name }
+        fn name(&self) -> &str {
+            self.name
+        }
 
         fn definition(&self) -> ToolDefinition {
             ToolDefinition {
@@ -90,11 +97,19 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_or_mismatched_tool_names() {
-        let tool = || Box::new(TestTool { name: "search", definition_name: "search" }) as Box<dyn Tool>;
+        let tool = || {
+            Box::new(TestTool {
+                name: "search",
+                definition_name: "search",
+            }) as Box<dyn Tool>
+        };
         let error = Assistant::new(vec![tool(), tool()]).err().unwrap();
         assert!(error.to_string().contains("duplicate tool name"));
 
-        let tool = TestTool { name: "search", definition_name: "other" };
+        let tool = TestTool {
+            name: "search",
+            definition_name: "other",
+        };
         let error = Assistant::new(vec![Box::new(tool)]).err().unwrap();
         assert!(error.to_string().contains("invalid or duplicate tool name"));
     }

@@ -9,6 +9,7 @@ use crate::{
             tool_call_reviewer::{Decision, ToolCallReviewer},
         },
         session_store::SessionStore,
+        tool_approval::ToolApproval,
     },
     domain::{
         message::{AssistantMessage, Message},
@@ -21,7 +22,8 @@ pub struct AgentService {
     model_client: Box<dyn ModelClient>,
     session_store: Box<dyn SessionStore>,
     role: Box<dyn Role>,
-    reviewer: Box<dyn ToolCallReviewer>,
+    reviewer: ToolCallReviewer,
+    approval: Box<dyn ToolApproval>,
     model_setting: ModelSetting,
     max_iterations: usize,
 }
@@ -31,7 +33,8 @@ impl AgentService {
         model_client: Box<dyn ModelClient>,
         session_store: Box<dyn SessionStore>,
         role: Box<dyn Role>,
-        reviewer: Box<dyn ToolCallReviewer>,
+        reviewer: ToolCallReviewer,
+        approval: Box<dyn ToolApproval>,
         model_setting: ModelSetting,
         max_iterations: usize,
     ) -> anyhow::Result<Self> {
@@ -43,6 +46,7 @@ impl AgentService {
             session_store,
             role,
             reviewer,
+            approval,
             model_setting,
             max_iterations,
         })
@@ -81,12 +85,12 @@ impl AgentService {
                 Message::Assistant { tool_calls, .. } => {
                     pending.extend(tool_calls.iter().map(|c| c.id.clone()))
                 }
-                Message::Tool { tool_call_id, .. } => pending.retain(|id| id != tool_call_id),
-                Message::User { .. } => {}
+                Message::ToolResult { tool_call_id, .. } => pending.retain(|id| id != tool_call_id),
+                Message::User { .. } | Message::PlanResult { .. } => {}
             }
         }
         for id in pending {
-            session.messages.push(Message::Tool {
+            session.messages.push(Message::ToolResult {
                 tool_call_id: id,
                 content: "Interrupted before a result was saved; execution outcome is unknown and was not retried.".into(),
             });
@@ -138,24 +142,35 @@ impl AgentService {
                 let call = &tool_calls[index];
                 let result = match self.role.tool(&call.name) {
                     None => format!("Unknown tool: {}", call.name),
-                    Some(tool) => match self.reviewer.review(call) {
-                        Ok(Decision::Allowed) => match tool.execute(&call.arguments) {
-                            Ok(output) => output,
-                            Err(error) => format!("Tool execution failed: {error:#}"),
+                    Some(tool) => match self.reviewer.review(
+                        self.model_client.as_ref(),
+                        &self.model_setting,
+                        &session.messages,
+                        call,
+                    ) {
+                        Ok(Decision::Allowed) => match self.approval.approve(call) {
+                            Ok(Decision::Allowed) => match tool.execute(&call.arguments) {
+                                Ok(output) => output,
+                                Err(error) => format!("Tool execution failed: {error:#}"),
+                            },
+                            Ok(Decision::Rejected { reason }) => {
+                                format!("Tool call rejected by user: {reason}")
+                            }
+                            Err(error) => format!("Tool approval failed; call rejected: {error:#}"),
                         },
                         Ok(Decision::Rejected { reason }) => {
-                            format!("Tool call rejected: {reason}")
+                            format!("Tool call rejected by AI reviewer: {reason}")
                         }
-                        Err(error) => format!("Tool review failed; call rejected: {error:#}"),
+                        Err(error) => format!("AI tool review failed; call rejected: {error:#}"),
                     },
                 };
                 let id = call.id.clone();
-                session.messages.push(Message::Tool {
+                session.messages.push(Message::ToolResult {
                     tool_call_id: id,
                     content: result,
                 });
                 self.session_store.save(&session).with_context(|| {
-                    let Message::Tool { content, .. } = session.messages.last().unwrap() else { unreachable!() };
+                    let Message::ToolResult { content, .. } = session.messages.last().unwrap() else { unreachable!() };
                     format!("saving tool result failed; execution may already have occurred. Result: {content}")
                 })?;
             }
@@ -172,7 +187,7 @@ mod tests {
     use super::*;
     use crate::application::role::assistant::Assistant;
     use crate::application::session_store::SessionLock;
-    use crate::domain::message::ToolCall;
+    use crate::domain::message::{Plan, SubPlan, ToolCall};
     use crate::domain::{context::Context, tool::ToolDefinition};
     use std::{cell::RefCell, rc::Rc};
 
@@ -201,7 +216,7 @@ mod tests {
             context: &Context<'_>,
             _: &ModelSetting,
         ) -> anyhow::Result<AssistantMessage> {
-            assert!(context.messages.iter().any(|message| matches!(message, Message::Tool { tool_call_id, content } if tool_call_id == "pending" && content.contains("unknown"))));
+            assert!(context.messages.iter().any(|message| matches!(message, Message::ToolResult { tool_call_id, content } if tool_call_id == "pending" && content.contains("unknown"))));
             Ok(AssistantMessage {
                 content: "done".into(),
                 tool_calls: vec![],
@@ -209,8 +224,8 @@ mod tests {
         }
     }
     struct Reviewer;
-    impl ToolCallReviewer for Reviewer {
-        fn review(&self, _: &ToolCall) -> anyhow::Result<Decision> {
+    impl ToolApproval for Reviewer {
+        fn approve(&self, _: &ToolCall) -> anyhow::Result<Decision> {
             Ok(Decision::Allowed)
         }
     }
@@ -218,19 +233,31 @@ mod tests {
     fn interrupted_calls_are_resolved_without_replaying_them() {
         let saved = Rc::new(RefCell::new(Some(Session {
             id: "s".into(),
-            messages: vec![Message::Assistant {
-                content: String::new(),
-                tool_calls: vec![ToolCall {
-                    id: "pending".into(),
-                    name: "bash".into(),
-                    arguments: serde_json::json!({}),
-                }],
-            }],
+            messages: vec![
+                Message::Assistant {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "pending".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                },
+                Message::PlanResult {
+                    goal: "goal".into(),
+                    plan: Plan {
+                        sub_plans: vec![SubPlan {
+                            title: "stage".into(),
+                            items: vec!["task".into()],
+                        }],
+                    },
+                },
+            ],
         })));
         let mut service = AgentService::new(
             Box::new(Model),
             Box::new(Store(saved.clone())),
             Box::new(Assistant::new(vec![]).unwrap()),
+            ToolCallReviewer::new(),
             Box::new(Reviewer),
             ModelSetting {
                 model_id: "m".into(),
@@ -239,7 +266,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(service.chat("s", "next").unwrap(), "done");
-        assert_eq!(saved.borrow().as_ref().unwrap().messages.len(), 4);
+        assert_eq!(saved.borrow().as_ref().unwrap().messages.len(), 5);
     }
 
     #[test]
@@ -289,6 +316,7 @@ mod tests {
             Box::new(PlanningModel),
             Box::new(Store(saved)),
             Box::new(PlanningRole),
+            ToolCallReviewer::new(),
             Box::new(Reviewer),
             ModelSetting {
                 model_id: "m".into(),
@@ -308,9 +336,15 @@ mod tests {
         impl ModelClient for CallingModel {
             fn generate(
                 &self,
-                _: &Context<'_>,
+                context: &Context<'_>,
                 _: &ModelSetting,
             ) -> anyhow::Result<AssistantMessage> {
+                if context.instruction.contains("你是工具调用审查角色") {
+                    return Ok(AssistantMessage {
+                        content: r#"{"decision":"allowed"}"#.into(),
+                        tool_calls: vec![],
+                    });
+                }
                 let turn = self.0.get();
                 self.0.set(turn + 1);
                 Ok(if turn == 0 {
@@ -353,6 +387,7 @@ mod tests {
             Box::new(CallingModel(Rc::new(Cell::new(0)))),
             Box::new(Store(saved.clone())),
             Box::new(Assistant::new(vec![Box::new(CountingTool(calls.clone()))]).unwrap()),
+            ToolCallReviewer::new(),
             Box::new(Reviewer),
             ModelSetting {
                 model_id: "m".into(),
@@ -363,9 +398,181 @@ mod tests {
         let error = service.chat("s", "first").unwrap_err().to_string();
         assert!(error.contains("completed tool results were saved"));
         assert!(saved.borrow().as_ref().unwrap().messages.iter().any(
-            |message| matches!(message, Message::Tool { tool_call_id, content } if tool_call_id == "call" && content == "executed")
+            |message| matches!(message, Message::ToolResult { tool_call_id, content } if tool_call_id == "call" && content == "executed")
         ));
         assert_eq!(service.chat("s", "next").unwrap(), "done");
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn ai_review_and_human_approval_both_gate_tool_execution() {
+        use crate::domain::tool::Tool;
+        use std::cell::Cell;
+
+        #[derive(Clone, Copy)]
+        enum Review {
+            Allow,
+            Reject,
+            Invalid,
+            Error,
+        }
+        struct ScenarioModel(Review);
+        impl ModelClient for ScenarioModel {
+            fn generate(
+                &self,
+                context: &Context<'_>,
+                _: &ModelSetting,
+            ) -> anyhow::Result<AssistantMessage> {
+                if context.instruction.contains("你是工具调用审查角色") {
+                    assert!(context.tools.is_empty());
+                    let Message::User { content } = &context.messages[0] else {
+                        panic!("expected review input");
+                    };
+                    let input: serde_json::Value = serde_json::from_str(content)?;
+                    assert_eq!(input["tool_call"]["name"], "count");
+                    let content = match self.0 {
+                        Review::Allow => r#"{"decision":"allowed"}"#,
+                        Review::Reject => r#"{"decision":"rejected","reason":"unsafe"}"#,
+                        Review::Invalid => "not json",
+                        Review::Error => anyhow::bail!("review model unavailable"),
+                    };
+                    return Ok(AssistantMessage {
+                        content: content.into(),
+                        tool_calls: vec![],
+                    });
+                }
+                if matches!(context.messages.last(), Some(Message::ToolResult { .. })) {
+                    return Ok(AssistantMessage {
+                        content: "done".into(),
+                        tool_calls: vec![],
+                    });
+                }
+                Ok(AssistantMessage {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "call".into(),
+                        name: "count".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                })
+            }
+        }
+
+        struct CountingTool(Rc<Cell<usize>>);
+        impl Tool for CountingTool {
+            fn name(&self) -> &str {
+                "count"
+            }
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "count".into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                }
+            }
+            fn execute(&self, _: &serde_json::Value) -> anyhow::Result<String> {
+                self.0.set(self.0.get() + 1);
+                Ok("executed".into())
+            }
+        }
+
+        struct HumanApproval {
+            calls: Rc<Cell<usize>>,
+            allow: bool,
+            fail: bool,
+        }
+        impl ToolApproval for HumanApproval {
+            fn approve(&self, _: &ToolCall) -> anyhow::Result<Decision> {
+                self.calls.set(self.calls.get() + 1);
+                if self.fail {
+                    anyhow::bail!("approval unavailable");
+                }
+                Ok(if self.allow {
+                    Decision::Allowed
+                } else {
+                    Decision::Rejected {
+                        reason: "no".into(),
+                    }
+                })
+            }
+        }
+
+        for (review, approve, fail, expected_human, expected_exec, expected_result) in [
+            (Review::Allow, true, false, 1, 1, "executed"),
+            (Review::Allow, false, false, 1, 0, "rejected by user"),
+            (Review::Allow, true, true, 1, 0, "approval failed"),
+            (
+                Review::Reject,
+                true,
+                false,
+                0,
+                0,
+                "rejected by AI reviewer: unsafe",
+            ),
+            (Review::Invalid, true, false, 0, 0, "AI tool review failed"),
+            (Review::Error, true, false, 0, 0, "AI tool review failed"),
+        ] {
+            let saved = Rc::new(RefCell::new(None));
+            let executions = Rc::new(Cell::new(0));
+            let approvals = Rc::new(Cell::new(0));
+            let mut agent = AgentService::new(
+                Box::new(ScenarioModel(review)),
+                Box::new(Store(saved.clone())),
+                Box::new(Assistant::new(vec![Box::new(CountingTool(executions.clone()))]).unwrap()),
+                ToolCallReviewer::new(),
+                Box::new(HumanApproval {
+                    calls: approvals.clone(),
+                    allow: approve,
+                    fail,
+                }),
+                ModelSetting {
+                    model_id: "m".into(),
+                },
+                2,
+            )
+            .unwrap();
+            assert_eq!(agent.chat("s", "request").unwrap(), "done");
+            assert_eq!(approvals.get(), expected_human);
+            assert_eq!(executions.get(), expected_exec);
+            assert!(saved.borrow().as_ref().unwrap().messages.iter().any(|message|
+                matches!(message, Message::ToolResult { content, .. } if content.contains(expected_result))));
+        }
+    }
+
+    #[test]
+    fn planner_role_returns_and_persists_a_numbered_plan() {
+        use crate::application::role::planner::Planner;
+
+        struct PlanningModel;
+        impl ModelClient for PlanningModel {
+            fn generate(
+                &self,
+                context: &Context<'_>,
+                _: &ModelSetting,
+            ) -> anyhow::Result<AssistantMessage> {
+                assert!(context.tools.is_empty());
+                Ok(AssistantMessage {
+                    content: r#"{"sub_plans":[{"title":"准备","items":["分析","设计"]}]}"#.into(),
+                    tool_calls: vec![],
+                })
+            }
+        }
+
+        let saved = Rc::new(RefCell::new(None));
+        let mut service = AgentService::new(
+            Box::new(PlanningModel),
+            Box::new(Store(saved.clone())),
+            Box::new(Planner::new("完成项目")),
+            ToolCallReviewer::new(),
+            Box::new(Reviewer),
+            ModelSetting { model_id: "m".into() },
+            1,
+        ).unwrap();
+        let result = service.chat("s", "开始规划").unwrap();
+        assert_eq!(result, "目标：完成项目\n1. 准备\n  1.1 分析\n  1.2 设计");
+        assert!(matches!(
+            saved.borrow().as_ref().unwrap().messages.last(),
+            Some(Message::Assistant { content, tool_calls }) if content == &result && tool_calls.is_empty()
+        ));
     }
 }

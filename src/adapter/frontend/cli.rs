@@ -14,14 +14,14 @@ use crossterm::{
 
 use super::{commands::{parse, Input}, input::{add_messages, draw_editor, erase_editor, print_entries, safe_text, show_history, Editor, EditorAction, Entry, Screen}};
 use crate::{
-    application::{agent_service::AgentService, role::tool_call_reviewer::{Decision, ToolCallReviewer}},
+    application::{agent_service::AgentService, role::tool_call_reviewer::Decision, tool_approval::ToolApproval},
     domain::message::{Message, ToolCall},
 };
 
-pub(crate) struct TerminalReviewer;
+pub(crate) struct TerminalApprover;
 
-impl ToolCallReviewer for TerminalReviewer {
-    fn review(&self, call: &ToolCall) -> anyhow::Result<Decision> {
+impl ToolApproval for TerminalApprover {
+    fn approve(&self, call: &ToolCall) -> anyhow::Result<Decision> {
         if !io::stdin().is_terminal() {
             return Ok(Decision::Rejected {
                 reason: "approval requires an interactive terminal".into(),

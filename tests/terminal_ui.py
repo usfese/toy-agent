@@ -1,15 +1,38 @@
 import atexit, http.server, json, os, pty, select, signal, struct, subprocess, tempfile, termios, fcntl, threading, time
 binary=os.path.abspath('target/debug/toy-agent')
+events=[]; events_lock=threading.Lock()
+command='printf tool-ok #\u202e'
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self,*a): pass
     def do_POST(self):
         data=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         assert self.headers.get('Authorization') == 'Bearer test'
-        if data['messages'][-1]['role']=='user':
-            assert data['messages'][-1]['content'] == '  hello\n'
-            message={'role':'assistant','content':None,'tool_calls':[{'id':'a1','type':'function','function':{'name':'bash','arguments':json.dumps({'command':'printf tool-ok #\u202e'})}}]}
+        messages=data['messages']
+        assert data['model']=='test-model'
+        if '你是工具调用审查角色' in messages[0]['content']:
+            assert 'tools' not in data or data['tools']==[], data.get('tools')
+            assert len(messages)==2 and messages[1]['role']=='user'
+            review=json.loads(messages[1]['content'])
+            assert review['tool_call']=={'id':'a1','name':'bash','arguments':{'command':command}}
+            assert any(m['role']=='user' and m['content']=='  hello\n' for m in review['history'])
+            with events_lock:
+                assert events==['assistant'], events
+                events.append('reviewer')
+            message={'role':'assistant','content':json.dumps({'decision':'allowed'})}
+            reason='stop'
+        elif messages[-1]['role']=='user':
+            assert messages[-1]['content'] == '  hello\n'
+            with events_lock:
+                assert events==[], events
+                events.append('assistant')
+            message={'role':'assistant','content':None,'tool_calls':[{'id':'a1','type':'function','function':{'name':'bash','arguments':json.dumps({'command':command})}}]}
             reason='tool_calls'
         else:
+            assert messages[-1]['role']=='tool' and messages[-1]['tool_call_id']=='a1'
+            assert 'tool-ok' in messages[-1]['content'], messages[-1]
+            with events_lock:
+                assert events==['assistant','reviewer','approval'], events
+                events.append('assistant_after_tool')
             message={'role':'assistant','content':'# Heading\n\n**bold**\n\n'+'\n\n'.join(f'line-{i:02}' for i in range(60))}
             reason='stop'
         body=json.dumps({'choices':[{'message':message,'finish_reason':reason}]}).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
@@ -41,7 +64,13 @@ with tempfile.TemporaryDirectory() as tmp:
     send('\x1b[200~first\n第二\x1b[201~'); expect('第二')
     send('\x03'); send('\x1b[200~  hello\n\x1b[201~\r'); expect('Allow? [y/N]')
     assert b'\\u{202e}' in output, 'bidirectional control is not visibly escaped'
-    send('y\n'); expect('Heading');expect('bold');expect('line-59');expect('test-model')
+    with events_lock:
+        assert events==['assistant','reviewer'], events
+        send('y\n')
+        events.append('approval')
+    expect('Heading');expect('bold');expect('line-59');expect('test-model')
+    with events_lock:
+        assert events==['assistant','reviewer','approval','assistant_after_tool'], events
     assert output.count(b'\x1b[?1049h')==1, output.count(b'\x1b[?1049h')
     assert b'\x1b[?1049l' not in output, 'left alternate screen during request'
     send('\x1b[5~'); expect('line-')
